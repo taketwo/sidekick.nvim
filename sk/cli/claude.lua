@@ -5,6 +5,7 @@ return {
   url = "https://github.com/anthropics/claude-code",
   resume = { "--resume" },
   continue = { "--continue" },
+  native_scroll = true,
   format = function(text)
     local Text = require("sidekick.text")
 
