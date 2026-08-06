@@ -53,9 +53,16 @@ end
 ---@return table?
 function M.json(cmd, opts)
   local lines = Util.exec(cmd, opts)
-  if not lines or #lines == 0 then
+
+  if not lines then
     return nil
   end
+
+  -- Some successful commands, including `pane run`, do not return a payload.
+  if #lines == 0 then
+    return {}
+  end
+
   local ok, ret = pcall(vim.json.decode, table.concat(lines, "\n"))
   if not ok or type(ret) ~= "table" then
     if not opts or opts.notify ~= false then
@@ -63,6 +70,7 @@ function M.json(cmd, opts)
     end
     return nil
   end
+
   return ret
 end
 
@@ -115,6 +123,13 @@ function M.shell_cmd(cmd)
   )
 end
 
+--- Build a command that replaces the pane shell with the tool process.
+---@param cmd string[]
+---@return string
+function M.exec_cmd(cmd)
+  return "exec " .. M.shell_cmd(cmd)
+end
+
 ---@return sidekick.cli.terminal.Cmd?
 function M:attach()
   if not self.external and self.herdr_terminal_id then
@@ -135,22 +150,28 @@ end
 
 ---@return sidekick.cli.terminal.Cmd?
 function M:start()
+  local pane
   if not self.external then
     if not M.ensure_server(self.mux_session) then
       return
     end
-    if self:start_agent() then
-      return { cmd = self:herdr({ "terminal", "attach", self.herdr_terminal_id }) }
-    end
+    pane = self:create_workspace_pane()
   elseif Config.cli.mux.create == "window" then
-    if self:start_tab() then
-      Util.info(("Started **%s** in a new Herdr tab"):format(self.tool.name))
-    end
+    pane = self:create_tab_pane()
   elseif Config.cli.mux.create == "split" then
-    local split = Config.cli.mux.split.vertical and "right" or "down"
-    if self:start_agent(split) then
-      Util.info(("Started **%s** in a new Herdr split"):format(self.tool.name))
-    end
+    pane = self:create_split_pane(Config.cli.mux.split.vertical and "right" or "down")
+  end
+
+  if not pane or not self:launch_pane(pane) then
+    return
+  end
+
+  if not self.external then
+    return { cmd = self:herdr({ "terminal", "attach", self.herdr_terminal_id }) }
+  elseif Config.cli.mux.create == "window" then
+    Util.info(("Started **%s** in a new Herdr tab"):format(self.tool.name))
+  elseif Config.cli.mux.create == "split" then
+    Util.info(("Started **%s** in a new Herdr split"):format(self.tool.name))
   end
 end
 
@@ -165,44 +186,70 @@ function M:update_pane(pane)
   self.started = true
 end
 
----@param split? "right"|"down"
+--- Create the root pane for a dedicated Herdr workspace.
 ---@return table?
-function M:start_agent(split)
-  local cmd = self:herdr({ "agent", "start", self.sid, "--cwd", self.cwd, "--no-focus" })
-  if split then
-    -- Herdr's agent API currently exposes split direction but not split ratio.
-    -- Keep honoring direction; size is applied by Herdr's normal split policy.
-    vim.list_extend(cmd, { "--split", split })
-  end
-  self:add_cmd(cmd)
-
+function M:create_workspace_pane()
+  local cmd = self:herdr({ "workspace", "create", "--cwd", self.cwd, "--label", self.sid, "--no-focus" })
+  self:add_env(cmd)
   local ret = M.json(cmd, { notify = true })
-  local agent = ret and ret.result and ret.result.agent
-  if agent then
-    self:update_pane(agent)
-    return agent
-  end
+  return ret and ret.result and ret.result.root_pane
 end
 
---- Start a new Herdr tab (referred to as Window in Sidekick/Tmux) for this session.
+--- Create the root pane of a new Herdr tab.
 ---@return table?
-function M:start_tab()
-  local cmd = self:herdr({ "tab", "create", "--cwd", self.cwd, "--label", self.sid, "--no-focus" })
+function M:create_tab_pane()
+  local cmd = self:herdr({ "tab", "create" })
+  if vim.env.HERDR_WORKSPACE_ID then
+    vim.list_extend(cmd, { "--workspace", vim.env.HERDR_WORKSPACE_ID })
+  end
+  vim.list_extend(cmd, { "--cwd", self.cwd, "--label", self.sid, "--no-focus" })
   self:add_env(cmd)
-
   local ret = M.json(cmd, { notify = true })
-  local pane = ret and ret.result and ret.result.root_pane
-  if not pane then
-    return
+  return ret and ret.result and ret.result.root_pane
+end
+
+--- Create a split of the pane containing Neovim.
+---@param direction "right"|"down"
+---@return table?
+function M:create_split_pane(direction)
+  local cmd = self:herdr({
+    "pane",
+    "split",
+    "--current",
+    "--direction",
+    direction,
+    "--cwd",
+    self.cwd,
+    "--no-focus",
+  })
+  local size = Config.cli.mux.split.size
+  if size > 0 and size <= 1 then
+    vim.list_extend(cmd, { "--ratio", tostring(size) })
+  end
+  self:add_env(cmd)
+  local ret = M.json(cmd, { notify = true })
+  return ret and ret.result and ret.result.pane
+end
+
+--- Replace a newly-created pane's shell with the configured tool process.
+---@param pane table
+---@return boolean
+function M:launch_pane(pane)
+  local pane_id = pane.pane_id or pane.id
+  if not pane_id then
+    Util.error("Herdr did not return a pane id")
+    return false
   end
 
-  local run = Util.exec(self:herdr({ "pane", "run", pane.pane_id, M.shell_cmd(self.tool.cmd) }), { notify = true })
-  if not run then
-    return
+  local ret = M.json(self:herdr({ "pane", "run", pane_id, M.exec_cmd(self.tool.cmd) }), { notify = true })
+  if not ret then
+    -- The pane belongs to this launch attempt, so do not leave its idle shell behind.
+    M.json(self:herdr({ "pane", "close", pane_id }), { notify = false })
+    return false
   end
 
   self:update_pane(pane)
-  return pane
+  return true
 end
 
 function M:is_running()
@@ -221,14 +268,6 @@ function M:add_env(ret)
   end
 end
 
---- Add the tool command to a Herdr command, with environment variables.
----@param ret string[]
-function M:add_cmd(ret)
-  self:add_env(ret)
-  ret[#ret + 1] = "--"
-  vim.list_extend(ret, self.tool.cmd)
-end
-
 --- List all panes in the Herdr session with their command and cwd.
 ---@param opts? {session?:string,current?:boolean,notify?:boolean}
 function M.panes(opts)
@@ -243,7 +282,7 @@ function M.panes(opts)
       workspace_id = pane.workspace_id,
       tab_id = pane.tab_id,
       cwd = pane.foreground_cwd or pane.cwd,
-      agent = pane.agent,
+      agent = pane.agent or (pane.agent_session and pane.agent_session.agent),
       mux_session = opts.session or (opts.current and (vim.env.HERDR_SESSION or DEFAULT_SESSION) or nil),
       herdr_current = opts.current,
     }
